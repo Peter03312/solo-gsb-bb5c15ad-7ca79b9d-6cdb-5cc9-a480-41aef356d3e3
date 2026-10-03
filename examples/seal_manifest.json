@@ -1,0 +1,8 @@
+{
+  "items": [
+    {"container_no": "C001", "expected_seal_no": "SEAL-A001"},
+    {"container_no": "C002", "expected_seal_no": "SEAL-A002"},
+    {"container_no": "C003", "expected_seal_no": "SEAL-A003"},
+    {"container_no": "C004", "expected_seal_no": "SEAL-A004"}
+  ]
+}

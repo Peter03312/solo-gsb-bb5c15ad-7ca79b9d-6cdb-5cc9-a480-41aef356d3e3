@@ -704,6 +704,201 @@ class HandoverOut(BaseModel):
     created_at: str
 
 
+# ---------- 离港前封签核对与放行凭证 ----------
+
+
+class SealManifestItemIn(BaseModel):
+    container_no: str = Field(..., description="箱号（须为方案中的箱）")
+    expected_seal_no: str = Field(..., description="该箱预期封签号（非空，清单内互异）")
+
+    @field_validator("container_no")
+    @classmethod
+    def _container_no(cls, v: str) -> str:
+        return _require_nonempty_str(v, "箱号")
+
+    @field_validator("expected_seal_no")
+    @classmethod
+    def _expected_seal_no(cls, v: str) -> str:
+        return _require_nonempty_str(v, "预期封签号")
+
+
+class SealManifestRegisterIn(BaseModel):
+    """以方案编号登记预期封签清单：覆盖全部箱且封签号互异；冻结后不能改写。"""
+
+    items: list[SealManifestItemIn] = Field(
+        ..., description="逐箱预期封签条目；须与方案箱项完全一致（空箱方案传空列表）"
+    )
+
+    @model_validator(mode="after")
+    def _unique(self) -> "SealManifestRegisterIn":
+        nos = [i.container_no for i in self.items]
+        if len(set(nos)) != len(nos):
+            dup = sorted({n for n in nos if nos.count(n) > 1})
+            raise ValueError(f"清单内箱号重复：{', '.join(dup)}")
+        seals = [i.expected_seal_no for i in self.items]
+        if len(set(seals)) != len(seals):
+            dup = sorted({s for s in seals if seals.count(s) > 1})
+            raise ValueError(f"封签号须互异，重复封签号：{', '.join(dup)}")
+        return self
+
+
+class SealManifestItemOut(BaseModel):
+    container_no: str
+    expected_seal_no: str
+
+
+class SealManifestOut(BaseModel):
+    plan_id: str
+    revision_no: int
+    status: str = Field(
+        ..., description="current=方案修订仍当前；historical=方案修订已被取代（只读）"
+    )
+    container_count: int
+    scan_version: int = Field(..., description="扫描台账版本：0 起，每登记一条新扫描 +1")
+    manifest_fingerprint: str = Field(..., description="清单内容指纹（SHA-256 十六进制）")
+    fingerprint_algorithm: str
+    items: list[SealManifestItemOut]
+    created_at: str
+
+
+class SealScanIn(BaseModel):
+    """现场封签核对扫描登记请求：方案号取路径参数。"""
+
+    container_no: str = Field(..., description="箱号（须在预期清单中，未知箱号拒绝登记）")
+    observed_seal_no: str = Field(..., description="实见封签号（非空）")
+    check_minute: int = Field(..., ge=0, description="检查分钟（非负整数）")
+    scan_no: str = Field(
+        ..., description="全局唯一扫描号；同号同内容重试返回原记录，同号异内容冲突"
+    )
+
+    @field_validator("container_no")
+    @classmethod
+    def _container_no(cls, v: str) -> str:
+        return _require_nonempty_str(v, "箱号")
+
+    @field_validator("observed_seal_no")
+    @classmethod
+    def _observed_seal_no(cls, v: str) -> str:
+        return _require_nonempty_str(v, "实见封签号")
+
+    @field_validator("scan_no")
+    @classmethod
+    def _scan_no(cls, v: str) -> str:
+        return _require_nonempty_str(v, "扫描号")
+
+
+class SealScanOut(BaseModel):
+    scan_no: str
+    plan_id: str
+    container_no: str
+    observed_seal_no: str
+    expected_seal_no: str = Field(..., description="冻结清单中该箱预期封签号")
+    matched: bool = Field(..., description="登记时实见封签是否与预期一致（不符留痕但不算通过）")
+    check_minute: int
+    scan_version: int = Field(..., description="本次登记后的扫描台账版本")
+    registered_at: str
+
+
+class SealBoxStatusOut(BaseModel):
+    container_no: str
+    expected_seal_no: str
+    scanned: bool = Field(..., description="该箱是否已有扫描记录")
+    latest_scan_no: str | None = Field(
+        ..., description="生效扫描号：检查分钟较晚者为准，同分钟以登记顺序较晚者为准"
+    )
+    observed_seal_no: str | None
+    check_minute: int | None
+    matched: bool | None = Field(..., description="生效扫描是否与预期一致；未扫描为 null")
+    passed: bool = Field(..., description="是否通过核对：已扫描且生效扫描匹配预期")
+
+
+class SealBoardOut(BaseModel):
+    plan_id: str
+    revision_no: int
+    status: str = Field(
+        ..., description="current=方案修订仍当前；historical=方案修订已被取代（只读）"
+    )
+    scan_version: int
+    scans_fingerprint: str = Field(..., description="当前扫描台账指纹（SHA-256 十六进制）")
+    fingerprint_algorithm: str
+    boxes: list[SealBoxStatusOut] = Field(..., description="逐箱核对状态（按箱号升序）")
+    scans: list[SealScanOut] = Field(..., description="全部扫描留痕（按登记顺序）")
+
+
+class SealReleaseCreateIn(BaseModel):
+    """离港放行凭证申请。"""
+
+    application_no: str = Field(
+        ..., description="唯一申请号（非空字符串，全局唯一）；同号同内容重试返回原凭证"
+    )
+    handover_id: str = Field(
+        ..., description="当前交接凭证号；须属于本方案且仍对应当前实绩"
+    )
+    expected_scan_version: int = Field(
+        ..., ge=0, description="期望扫描版本；与当前扫描台账版本不一致返回 409"
+    )
+    cutoff_minute: int = Field(
+        ..., ge=0, description="放行截止分钟（非负整数）；每箱生效扫描须不晚于该时刻"
+    )
+
+    @field_validator("application_no")
+    @classmethod
+    def _application_no(cls, v: str) -> str:
+        return _require_nonempty_str(v, "申请号")
+
+    @field_validator("handover_id")
+    @classmethod
+    def _handover_id(cls, v: str) -> str:
+        return _require_nonempty_str(v, "交接凭证号")
+
+
+class SealReleaseContainerOut(BaseModel):
+    container_no: str
+    expected_seal_no: str
+    observed_seal_no: str
+    check_minute: int
+    scan_no: str = Field(..., description="签发时该箱生效扫描号")
+
+
+class SealReleaseSummaryOut(BaseModel):
+    container_count: int
+    cutoff_minute: int
+    scan_version: int
+    handover_id: str
+    fingerprint_algorithm: str
+
+
+class SealReleaseOut(BaseModel):
+    release_id: str = Field(..., description="放行凭证号（服务端生成，不可变）")
+    application_no: str = Field(..., description="申请号（客户端提供）")
+    plan_id: str
+    revision_no: int = Field(..., description="签发时固化的方案修订号")
+    handover_id: str = Field(..., description="签发所依据的交接凭证号")
+    cutoff_minute: int
+    expected_scan_version: int
+    scan_version: int = Field(..., description="签发时扫描台账版本")
+    scans_fingerprint: str = Field(..., description="签发时扫描台账指纹（SHA-256 十六进制）")
+    fingerprint_algorithm: str
+    containers: list[SealReleaseContainerOut] = Field(
+        ..., description="逐箱放行结果（签发时快照，不可变）"
+    )
+    summary: SealReleaseSummaryOut
+    still_valid: bool = Field(
+        ..., description="凭证是否仍有效：方案仍已确认、交接凭证仍对应当前实绩、"
+                        "且扫描台账未再变化"
+    )
+    plan_status: str = Field(..., description="方案当前状态（confirmed/superseded 等）")
+    handover_matches_current_actuals: bool = Field(
+        ..., description="签发所依据的交接凭证是否仍对应当前实绩"
+    )
+    matches_current_scans: bool = Field(
+        ..., description="凭证扫描指纹是否仍对应当前扫描台账（后续有新扫描则为 false）"
+    )
+    current_scan_version: int | None
+    current_scans_fingerprint: str | None
+    created_at: str
+
+
 class AssignmentOut(BaseModel):
     container_no: str
     slot_code: str

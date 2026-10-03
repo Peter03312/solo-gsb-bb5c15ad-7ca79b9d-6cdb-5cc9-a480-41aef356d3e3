@@ -40,6 +40,11 @@ def _clean_tables():
     import app.models as models
     db = SessionLocal()
     try:
+        db.query(models.SealReleaseItem).delete()
+        db.query(models.SealRelease).delete()
+        db.query(models.SealScan).delete()
+        db.query(models.SealManifestItem).delete()
+        db.query(models.SealManifest).delete()
         db.query(models.LoadingHandoverItem).delete()
         db.query(models.LoadingHandover).delete()
         db.query(models.LoadingActualEvent).delete()

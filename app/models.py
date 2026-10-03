@@ -703,6 +703,161 @@ class LoadingHandover(Base):
     )
 
 
+class SealManifest(Base):
+    """某方案修订的**预期封签清单**头（每方案至多一条，内容冻结不可改写）。
+
+    首次登记时覆盖方案全部箱且封签号互异；登记后清单内容（逐箱预期封签号）
+    不再改变：同内容重复登记按幂等返回原清单，异内容报冲突。方案修订被取代后
+    清单保留可查，但不再接受扫描登记。scan_version 为扫描台账版本（不属于清单
+    内容）：初始为 0，每成功登记一条新扫描 +1，供放行申请原子核对。
+    """
+
+    __tablename__ = "seal_manifests"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    plan_id: Mapped[str] = mapped_column(
+        ForeignKey("plans.id", ondelete="CASCADE"), nullable=False, unique=True
+    )
+    # 清单内容指纹（逐箱 箱号+预期封签号 规范 JSON 的 SHA-256），识别同内容重试
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    # 扫描台账版本：0 起，每登记一条新扫描 +1（清单内容本身冻结不变）
+    scan_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    items: Mapped[list["SealManifestItem"]] = relationship(
+        back_populates="manifest", cascade="all, delete-orphan"
+    )
+    plan: Mapped[Plan] = relationship()
+
+    __table_args__ = (
+        CheckConstraint("scan_version >= 0", name="ck_seal_manifest_scan_version"),
+    )
+
+
+class SealManifestItem(Base):
+    """预期封签清单逐箱条目：箱号与预期封签号（登记后不可变，封签号互异）。"""
+
+    __tablename__ = "seal_manifest_items"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    manifest_id: Mapped[int] = mapped_column(
+        ForeignKey("seal_manifests.id", ondelete="CASCADE"), index=True
+    )
+    container_no: Mapped[str] = mapped_column(String(64), nullable=False)
+    expected_seal_no: Mapped[str] = mapped_column(String(128), nullable=False)
+
+    manifest: Mapped[SealManifest] = relationship(back_populates="items")
+
+    __table_args__ = (
+        UniqueConstraint("manifest_id", "container_no",
+                         name="uq_seal_manifest_container"),
+        UniqueConstraint("manifest_id", "expected_seal_no",
+                         name="uq_seal_manifest_seal"),
+    )
+
+
+class SealScan(Base):
+    """现场封签核对扫描记录（只追加，扫描号全局唯一）。
+
+    每条记录留痕：箱号、实见封签号、检查分钟与登记次序（自增 id）。登记时即与
+    冻结清单比对得出 matched（不符也留痕但不算通过）；记录本身此后不改写。
+    同箱生效扫描以检查分钟较晚者为准，同分钟以登记顺序（id）较晚者为准。
+    同扫描号同内容重试返回原记录，异内容（含跨方案复用）冲突。
+    """
+
+    __tablename__ = "seal_scans"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    plan_id: Mapped[str] = mapped_column(
+        ForeignKey("plans.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    scan_no: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    container_no: Mapped[str] = mapped_column(String(64), nullable=False)
+    observed_seal_no: Mapped[str] = mapped_column(String(128), nullable=False)
+    check_minute: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 登记时与冻结清单的比对结果（留痕，不随后续操作改写）
+    matched: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    # 本次登记后的扫描台账版本（记录自含，供同号重试原样返回）
+    scan_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 请求内容指纹（scan_no+箱号+实见封签号+检查分钟 规范 JSON 的 SHA-256）
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    registered_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+
+    __table_args__ = (
+        CheckConstraint("check_minute >= 0", name="ck_seal_scan_minute"),
+        CheckConstraint("scan_version >= 1", name="ck_seal_scan_version"),
+        Index("ix_seal_scans_plan_container", "plan_id", "container_no"),
+    )
+
+
+class SealRelease(Base):
+    """离港放行**不可变凭证**头（申请号全局唯一）。
+
+    仅当方案仍已确认、所给交接凭证仍对应当前实绩、且每箱最新（生效）扫描匹配
+    预期封签且不晚于截止分钟时，在写事务内原子签发。签发时固化：方案修订号、
+    交接凭证号、期望/当前扫描版本、截止分钟、逐箱结果与扫描台账指纹；此后
+    后续扫描、实绩更正或方案取代只在查询时标示凭证失效（still_valid=false），
+    不改写凭证内容。
+    """
+
+    __tablename__ = "seal_releases"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=_new_id)
+    plan_id: Mapped[str] = mapped_column(
+        ForeignKey("plans.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    application_no: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    # 签发所依据的交接凭证（仅作溯源，不加外键）
+    handover_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    cutoff_minute: Mapped[int] = mapped_column(Integer, nullable=False)
+    expected_scan_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    scan_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    revision_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    container_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 签发时扫描台账指纹（规范 SHA-256），查询时与当前台账指纹比对
+    scans_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    items: Mapped[list["SealReleaseItem"]] = relationship(
+        back_populates="release", cascade="all, delete-orphan"
+    )
+    plan: Mapped[Plan] = relationship()
+
+    __table_args__ = (
+        CheckConstraint("cutoff_minute >= 0", name="ck_seal_release_cutoff"),
+        CheckConstraint("expected_scan_version >= 0",
+                        name="ck_seal_release_expected_version"),
+        CheckConstraint("scan_version >= 0", name="ck_seal_release_scan_version"),
+        CheckConstraint("container_count >= 0", name="ck_seal_release_containers"),
+        Index("ix_seal_releases_plan", "plan_id"),
+    )
+
+
+class SealReleaseItem(Base):
+    """放行凭证逐箱结果快照：预期/实见封签号、检查分钟与生效扫描号（不可变）。"""
+
+    __tablename__ = "seal_release_items"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    release_id: Mapped[str] = mapped_column(
+        ForeignKey("seal_releases.id", ondelete="CASCADE"), index=True
+    )
+    container_no: Mapped[str] = mapped_column(String(64), nullable=False)
+    expected_seal_no: Mapped[str] = mapped_column(String(128), nullable=False)
+    observed_seal_no: Mapped[str] = mapped_column(String(128), nullable=False)
+    check_minute: Mapped[int] = mapped_column(Integer, nullable=False)
+    scan_no: Mapped[str] = mapped_column(String(128), nullable=False)
+
+    release: Mapped[SealRelease] = relationship(back_populates="items")
+
+    __table_args__ = (
+        UniqueConstraint("release_id", "container_no",
+                         name="uq_seal_release_container"),
+    )
+
+
 class LoadingHandoverItem(Base):
     """凭证逐箱快照：实际起止与岸桥、冻结基线及完工延误偏差（签发后不可变）。"""
 
