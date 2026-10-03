@@ -27,6 +27,13 @@ from app.schemas import (
     ScheduleCreateIn,
     ScheduleEntryOut,
     ScheduleOut,
+    SealManifestIn,
+    SealManifestOut,
+    SealReleaseIn,
+    SealReleaseOut,
+    SealScanIn,
+    SealScanOut,
+    SealScanStatusOut,
     SlotDataIn,
     SlotRevisionOut,
     UnloadingCreateIn,
@@ -516,3 +523,118 @@ def get_plan_handover(
 def get_handover(handover_id: str, db: Session = Depends(get_db)):
     handover = services.get_handover_by_pk(db, handover_id)
     return services.build_handover_out(db, handover)
+
+
+# ---------- 离港前封签核对与放行凭证 ----------
+
+
+@router.post(
+    "/plans/{plan_id}/seal-manifest",
+    response_model=SealManifestOut,
+    responses={404: {"model": MessageOut}, 409: {"model": MessageOut},
+               422: {"model": MessageOut}},
+    summary="登记预期封签清单（覆盖全部箱、封签号互异；冻结后不可改写）",
+)
+def register_seal_manifest(
+    plan_id: str,
+    body: SealManifestIn,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    manifest, idempotent_hit = services.register_seal_manifest(db, plan_id, body)
+    # 同方案同内容重复登记返回原清单（200）；首次冻结为 201
+    response.status_code = 200 if idempotent_hit else 201
+    return services.build_seal_manifest_out(manifest)
+
+
+@router.get(
+    "/plans/{plan_id}/seal-manifest",
+    response_model=SealManifestOut,
+    responses={404: {"model": MessageOut}},
+    summary="查询预期封签清单（含当前扫描版本）",
+)
+def get_seal_manifest(plan_id: str, db: Session = Depends(get_db)):
+    return services.build_seal_manifest_out(services.get_seal_manifest(db, plan_id))
+
+
+@router.post(
+    "/plans/{plan_id}/seal-scans",
+    response_model=SealScanOut,
+    responses={404: {"model": MessageOut}, 409: {"model": MessageOut},
+               422: {"model": MessageOut}},
+    summary="现场登记封签扫描（扫描号全局唯一；封签不符留痕但不算通过）",
+)
+def register_seal_scan(
+    plan_id: str,
+    body: SealScanIn,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    view, idempotent_hit = services.register_seal_scan(db, plan_id, body)
+    # 同扫描号同内容重试返回原记录（200）；新扫描登记成功为 201
+    response.status_code = 200 if idempotent_hit else 201
+    return view
+
+
+@router.get(
+    "/plans/{plan_id}/seal-scans",
+    response_model=SealScanStatusOut,
+    responses={404: {"model": MessageOut}},
+    summary="查询封签扫描状态：扫描版本、逐箱最新有效扫描与全部留痕记录",
+)
+def get_seal_scan_status(plan_id: str, db: Session = Depends(get_db)):
+    return services.get_seal_scan_status(db, plan_id)
+
+
+@router.post(
+    "/plans/{plan_id}/seal-releases",
+    response_model=SealReleaseOut,
+    responses={404: {"model": MessageOut}, 409: {"model": MessageOut},
+               422: {"model": MessageOut}},
+    summary="申请离港放行凭证（方案仍确认+交接凭证对应当前实绩+逐箱最新扫描匹配且不晚于截止）",
+)
+def issue_seal_release(
+    plan_id: str,
+    body: SealReleaseIn,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    release, idempotent_hit = services.issue_seal_release(db, plan_id, body)
+    # 同申请号同内容重试返回原凭证（200）；新凭证签发为 201
+    response.status_code = 200 if idempotent_hit else 201
+    return services.build_seal_release_out(db, release)
+
+
+@router.get(
+    "/plans/{plan_id}/seal-releases",
+    response_model=list[SealReleaseOut],
+    responses={404: {"model": MessageOut}},
+    summary="列出某方案的离港放行凭证（历史凭证仍可读，标示是否仍有效）",
+)
+def list_plan_seal_releases(plan_id: str, db: Session = Depends(get_db)):
+    releases = services.list_plan_seal_releases(db, plan_id)
+    return [services.build_seal_release_out(db, r) for r in releases]
+
+
+@router.get(
+    "/plans/{plan_id}/seal-releases/{release_id}",
+    response_model=SealReleaseOut,
+    responses={404: {"model": MessageOut}},
+    summary="查询单个放行凭证（方案内；内容不可变，标示是否仍有效）",
+)
+def get_plan_seal_release(
+    plan_id: str, release_id: str, db: Session = Depends(get_db)
+):
+    release = services.get_plan_seal_release(db, plan_id, release_id)
+    return services.build_seal_release_out(db, release)
+
+
+@router.get(
+    "/seal-releases/{release_id}",
+    response_model=SealReleaseOut,
+    responses={404: {"model": MessageOut}},
+    summary="按凭证号查询放行凭证（全局，历史凭证仍可读）",
+)
+def get_seal_release(release_id: str, db: Session = Depends(get_db)):
+    release = services.get_seal_release_by_pk(db, release_id)
+    return services.build_seal_release_out(db, release)
