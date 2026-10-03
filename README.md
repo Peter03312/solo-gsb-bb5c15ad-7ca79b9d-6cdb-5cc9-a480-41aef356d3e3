@@ -1,0 +1,799 @@
+# 集装箱船配载方案核算服务
+
+基于 Python + FastAPI + SQLAlchemy(SQLite) + PuLP(CBC 整数规划求解器) 实现的集装箱船配载方案核算 HTTP 服务。
+
+录入按**堆栈（stack）与层（tier）**编号的槽位、各槽承重、纵向力臂、相邻槽位关系与全船允许力矩区间，以及箱号、重量、危险类别、卸港先后与不相容危险类别对；服务输出**每箱槽位、总力矩与方案修订号**。方案确认后，还可按岸桥数量与每箱吊装时长/时间窗生成**每箱开工、完工分钟与岸桥编号的装船时间表**，并按该排程逐箱登记**实际开工/完工事件（晚到可按分钟重放，首次登记冻结排程基线用于偏差核算）**，或按每个卸港的允许剩余总力矩闭区间生成**逐港卸箱顺序（各步港序、箱号与卸后剩余力矩）**，码头现场执行时还可**逐箱登记实际卸箱（允许偏离预案下一步：当前港取剩余箱最小卸港序号、须为同栈栈顶、卸后力矩入该港原定区间且新状态仍可卸完；首次登记冻结计划与所用箱重/力臂/港区间，方案被取代后只读、历史进度仍可查）**。装船完结交接时，可凭交接号、截止分钟、期望实绩版本、有效流水号集合与最大完工延误阈值申请**不可变交接凭证**（逐箱按冻结基线核算延误，凭证签发后实绩变化不改内容、仅标示是否仍对应当前实绩）。
+
+## 一、配载约束（全部为硬性约束）
+
+1. **承重**：任一槽位上箱的重量不得超过该槽承重；
+2. **堆叠支撑**：某层有箱时，其下层（同堆栈层编号相邻的槽）必须有箱，即不允许悬空；
+3. **重量次序**：下层箱不得轻于上层箱（`重量(下层) >= 重量(上层)`）；
+4. **卸港先后**：早卸港箱不得压在晚卸港箱下方（`discharge_order` 小者先卸，先卸港在上、后卸港在下）；
+5. **危险类别相邻**：不相容危险类别的两个箱不得占据互为相邻的槽位；
+6. **总力矩**：全船总力矩 `Σ(箱重量 × 所在槽纵向力臂)` 必须落在允许区间 `[min_moment, max_moment]` 内；
+7. 每个箱恰好占用一个槽，每个槽至多一箱，方案必须覆盖清单内**全部箱**。
+
+## 二、优选规则（完整可行方案之间）
+
+1. **最大占用层数最小**（占用到的最高 `tier` 最小）；
+2. 最大占用层数相同时，**按箱号排序后取槽位编号序列字典序最小**者。
+
+不存在完整可行方案时返回 `422` 并说明“无解”及原因，**不保存任何方案**。
+
+## 三、修订与确认
+
+- 槽位资料与箱清单分别维护，每次录入生成递增的**资料修订号**；
+- 方案带**方案修订号**：对已确认方案再次核算得到新修订（`revision_no + 1`），同一方案链以 `root_id` 关联；
+- 确认方案时必须提交该方案参与的**槽位资料修订号与箱清单修订号**，服务再与当前最新修订核对：
+  - 提交修订与方案修订不一致，或资料已产生更新修订（过期）→ 返回 `409` 拒绝，**原方案保持不变**；
+- 并发确认通过 SQLite `BEGIN IMMEDIATE` 写锁串行化 + `confirmed_slots(slot_code UNIQUE)` 唯一索引兜底，**不会产生冲突的已确认槽位占用**（一个槽位同一时刻至多属于一个已确认方案）；
+- 新修订确认后，同一方案链的旧已确认修订变为 `superseded` 并释放槽位占用。
+
+## 四、装船时间表（岸桥调度）
+
+方案**确认后**，按方案 ID 提交岸桥数量与每箱吊装参数，服务输出绑定该**方案修订**的可执行装船时间表。
+
+### 提交字段（`POST /api/plans/{plan_id}/schedules`）
+
+| 字段 | 含义 |
+| --- | --- |
+| `crane_count` | 岸桥数量，**正整数** |
+| `entries[]` | 每箱一条，箱项必须与方案修订**完全一致**（缺失或多余均拒绝） |
+| `entries[].no` | 箱号 |
+| `entries[].duration` | 该箱吊装时长（分钟），**正整数** |
+| `entries[].release_minute` | 最早开工分钟，非负整数 |
+| `entries[].deadline_minute` | 最迟完工分钟，非负整数；`release <= deadline`，允许恰在此时刻结束 |
+
+### 排程硬约束
+
+1. 每箱恰好由一台岸桥作业一次；
+2. 同一岸桥作业区间 `[开工, 完工)` 不得重叠（允许首尾相接）；
+3. 同堆栈**下层箱完工后上层箱才可开工**（按配载方案已占用层自底向上）；
+4. 每箱满足自身时间窗：`release_minute <= 开工` 且 `完工 <= deadline_minute`。
+
+### 优选规则
+
+1. **全部箱最晚完工时间（makespan）最早**；
+2. makespan 相同的方案间，**按箱号升序使 `(开工分钟, 岸桥编号)` 序列字典序最小**
+   （同一箱先比开工、再取最小编号岸桥）。
+
+### 保存与生命周期
+
+- 仅 `confirmed` 方案可生成排程；`draft`/`superseded` 返回 `409`；
+- 箱项缺失/多余、时间窗倒置等入参问题返回 `422`；时间窗/岸桥能力无解返回 `422` 且**不保存**；
+- **保存前在写锁内再次核对方案仍为已确认**：若求解期间方案被新修订取代，返回 `409` 且不保存；
+- 同一方案修订重复提交以新排程**原子替换**旧排程；
+- 方案修订被新修订确认取代（`superseded`）后，其排程状态转为 **`historical`**：
+  仍可通过 `GET /api/plans/{plan_id}/schedules` 或 `GET /api/schedules?historical=true` 查询，
+  但不再列入默认的当前排程；
+- **空箱方案**：提交 `entries: []`，返回空排程、`makespan = 0`。
+
+### 响应示例
+
+```json
+{
+  "plan_id": "f256fc9c...",
+  "revision_no": 1,
+  "status": "current",
+  "crane_count": 2,
+  "makespan": 20,
+  "entries": [
+    {"container_no": "C001", "start_minute": 12, "finish_minute": 20, "crane_no": 1, "stack": "A", "tier": 2},
+    {"container_no": "C002", "start_minute": 0,  "finish_minute": 12, "crane_no": 1, "stack": "A", "tier": 1},
+    {"container_no": "C003", "start_minute": 6,  "finish_minute": 16, "crane_no": 2, "stack": "B", "tier": 2},
+    {"container_no": "C004", "start_minute": 0,  "finish_minute": 6,  "crane_no": 2, "stack": "B", "tier": 1}
+  ],
+  "created_at": "..."
+}
+```
+
+curl 示例（请求体亦见 `examples/schedule.json`）：
+
+```bash
+# 方案确认后提交（422=箱项不一致/时间窗无解且不保存；409=方案未确认或保存前已被取代）
+curl -s -X POST $BASE/plans/<plan_id>/schedules \
+  -H 'Content-Type: application/json' -d @examples/schedule.json
+
+# 查询当前排程；加 ?historical=true 可同时查历史排程
+curl -s "$BASE/schedules"
+curl -s "$BASE/schedules?historical=true"
+
+# 按方案修订查询其绑定排程（历史排程同样可查，status=historical）
+curl -s $BASE/plans/<plan_id>/schedules
+```
+
+## 五、装船实绩登记（逐箱开工/完工，事件重放）
+
+方案**已确认且已有当前装船排程**后，码头按当前装船排程逐箱登记**实际开工、实际完工**。每次登记提交方案编号（路径参数）、箱号、岸桥编号、**非负实际分钟**与**事件流水号**。
+
+### 提交字段（`POST /api/plans/{plan_id}/actual-events`，请求体亦见 `examples/actual_events.json`）
+
+| 字段 | 含义 |
+| --- | --- |
+| `events[]` | 本次登记的事件列表，**至少一条**；可一次提交多条，允许重复提交（重试） |
+| `events[].seq` | 事件流水号，**正整数**，同一方案内唯一；用于重试幂等与冲突识别 |
+| `events[].event_type` | `start`=开工、`finish`=完工 |
+| `events[].container_no` | 箱号，**必须在该方案中**（否则 `422` 拒绝） |
+| `events[].crane_no` | 岸桥编号，正整数，不得超出冻结排程的岸桥数量 |
+| `events[].minute` | 实际发生分钟，**非负整数** |
+
+### 前置条件与拒绝码
+
+- 方案不存在 → `404`；方案为 `draft`（未确认）→ `409`；
+- **无当前装船排程 → `409`**（须先生成装船时间表）；
+- 箱不在方案中、岸桥越界、分钟为负、事件类型非法、批内流水号重复等入参问题 → `422`；
+- 方案修订被新修订取代（`superseded`）后，实绩**只读**：仍可查询，再登记返回 `409`。
+
+### 偏差基线冻结
+
+- **首次登记**在写锁内原子复核方案状态，并把**当时的当前排程整表复制冻结**为偏差基线（逐箱基线开工/完工分钟与岸桥编号，另留 `baseline_frozen_at`）；
+- 基线一旦冻结不再改变：此后对同一方案修订重排（排程原子替换）或方案被新修订取代，**均不改写已登记实绩与冻结基线**；
+- 并发的首次登记通过 SQLite `BEGIN IMMEDIATE` 写锁 + `plan_id UNIQUE` 头记录串行化，基线只冻结一次。
+
+### 晚到事件与重放规则
+
+事件**允许晚到**，不按到达顺序生效：每次登记把已确认事件与新事件合并，按**实际分钟**重放：
+
+1. 分钟小者先处理；
+2. **同一分钟先处理完工（finish）、再处理开工（start）**（允许同桥首尾相接）；
+3. 分钟与类型都相同时按到达先后（服务端自增序）。
+
+重放下的硬性校验：
+
+- **开工**：该箱尚无开工记录；该岸桥此刻空闲（同桥作业区间 `[开工, 完工)` 不得重叠，允许首尾相接）；**同堆栈其下各层箱均已完工**；
+- **完工**：该箱已开工；岸桥与该箱开工岸桥**一致**；完工分钟**严格晚于**开工分钟。
+
+**任一事件使整条重放链非法，则整次登记拒绝（`422`），已登记记录保持不变**（单批原子，批内不会只落一部分）。
+
+### 重试与冲突
+
+- 同一方案内**流水号相同、内容完全相同**的重复提交视为重试：不新增记录，返回 `200` 与**原结果**；含全新流水号的混合重试只追加新事件（`201`）；
+- 流水号相同但内容不同（类型/箱/桥/分钟任一变化）→ **冲突 `409`，记录不变**。
+
+### 查询（`GET /api/plans/{plan_id}/actuals`）
+
+返回实绩**版本**、冻结基线、每箱状态（`pending`/`in_progress`/`finished`）、实际起止分钟与实际岸桥、**相对冻结排程的偏差**（`start_delta_minutes`/`finish_delta_minutes`，正=延后、负=提前；`crane_changed`）、**未完箱列表**（未开工或已开工未完工，按箱号升序）、按分钟重放后的流水号顺序 `replay_order`、全部当前有效事件（含首次登记原值 `orig_minute`/`orig_crane_no` 与是否被更正 `corrected`）以及**更正历史 `corrections`**；方案被取代时 `read_only=true`。首次登记前查询返回 `404`。
+
+### 实绩更正（只改分钟或岸桥）
+
+发现已登记的装船实绩**分钟或岸桥录错**时，可对单条已登记事件发起更正：`POST /api/plans/{plan_id}/actual-events/correction`（请求体亦见 `examples/actual_event_correction.json`）。
+
+#### 提交字段
+
+| 字段 | 含义 |
+| --- | --- |
+| `seq` | **原事件流水号**（正整数）；原事件不存在返回 `404`（未找到） |
+| `expected_version` | **期望实绩版本**（正整数）；与当前版本不一致返回 `409`（版本过期） |
+| `request_id` | **更正请求号**（非空字符串，同一方案内唯一），用于重试幂等与冲突识别 |
+| `event` | **替代的完整事件内容**（结构同登记接口的单条事件） |
+| `event.seq` | 须等于外层 `seq`（**沿用原流水号**，改号返回 `422`） |
+| `event.event_type` | 须与原事件一致（**沿用原事件类型**，不一致 `422`） |
+| `event.container_no` | 须与原事件一致且仍在方案中（**沿用原箱号**，不一致 `422`） |
+| `event.crane_no` / `event.minute` | 替代岸桥（正整数，不超过冻结排程岸桥数量）/替代分钟（非负整数）；**只允许改这两项，且至少改一项**（与原事件完全相同返回 `422`） |
+
+#### 生效与拒绝规则
+
+- 更正后把替代事件并入，**按现有规则重放全部有效事件**（按实际分钟、同分钟完工先于开工）；
+- **若整条链非法（撞桥、下层未完工即开工、完工桥与开工不一致、完工不严格晚于开工、岸桥越界等），整次更正拒绝（`422`），实绩、版本与更正历史均不变**；
+- 更正成功：实绩 **`version` 加 1**（首次登记为 `1`），更新该事件的现行分钟/岸桥，**留存首次登记原值**（事件上的 `orig_minute`/`orig_crane_no`，`corrected=true`）并追加一条**更正历史**（请求号、流水号、期望版本、更正前后版本、更正前后分钟与岸桥）；
+- 方案 `draft`（无实绩）→ `409/404`；方案被取代（`superseded`）后实绩**只读**，更正返回 `409`。
+
+#### 重试与冲突
+
+- **同 `request_id` 且同内容**（期望版本、流水号、替代事件完全一致）的重复提交视为重试：返回 `200` 与**首次更正的结果快照**，**即使版本已被后续更正推进也不重复生效**（快照定格在该次更正后的版本）；
+- 同 `request_id` 但**异内容** → **冲突 `409`**，记录不变（再次更正请换新的更正请求号）；
+- `expected_version` 与当前版本不符（版本过期）→ **冲突 `409`**，记录不变。
+
+#### 与原登记接口的关系
+
+- 原登记接口 `POST /api/plans/{plan_id}/actual-events` **仍按首次登记内容**（`orig_*`）识别同流水号重试与冲突：用**原始内容**重试仍返回 `200`（不会把已更正值改回）；用更正后的内容走登记接口则因与首次登记内容不同而 **`409` 冲突**。要修正分钟/岸桥，请始终使用更正接口。
+
+### curl 示例
+
+```bash
+# 首次登记：原子冻结当前排程为偏差基线（201）
+curl -s -X POST $BASE/plans/<plan_id>/actual-events \
+  -H 'Content-Type: application/json' -d @examples/actual_events.json
+
+# 晚到事件（如补登较早分钟的完工）；同分钟先重放完工再开工
+curl -s -X POST $BASE/plans/<plan_id>/actual-events \
+  -H 'Content-Type: application/json' -d @examples/actual_event_late.json
+
+# 同流水号同内容重试 -> 200 返回原结果；同流水号异内容 -> 409 冲突
+# 重放非法（撞桥/下层未完工/完工桥不一致/完工不晚于开工）-> 422，记录不变
+
+# 更正录错的分钟或岸桥（201=更正生效、版本+1；200=同请求号同内容重试返回首次结果；
+# 404=原事件未找到；409=版本过期/同请求号异内容/方案已取代只读；
+# 422=改了类型或箱号/空更正/重放链非法，均不改实绩、版本与历史）
+curl -s -X POST $BASE/plans/<plan_id>/actual-events/correction \
+  -H 'Content-Type: application/json' -d @examples/actual_event_correction.json
+
+# 查询：版本、每箱状态、实际起止、相对冻结基线偏差、更正历史、未完箱、重放顺序
+curl -s $BASE/plans/<plan_id>/actuals
+```
+
+- 原登记接口 `POST /api/plans/{plan_id}/actual-events` **仍按首次登记内容**（`orig_*`）识别同流水号重试与冲突：用**原始内容**重试仍返回 `200`（不会把已更正值改回）；用更正后的内容走登记接口则因与首次登记内容不同而 **`409` 冲突**。要修正分钟/岸桥，请始终使用更正接口。
+
+## 五之一、装船完结交接（不可变凭证）
+
+装船完结交接时，对**已确认方案**按已确认方案申请不可变凭证：`POST /api/plans/{plan_id}/handovers`（请求体亦见 `examples/handover.json`）。
+
+### 提交字段
+
+| 字段 | 含义 |
+| --- | --- |
+| `handover_no` | **交接号**（非空字符串，**全局唯一**）；同交接号同内容请求重试幂等返回原凭证 |
+| `cutoff_minute` | **截止分钟**（非负整数）；每箱须在该时刻前（含）完工 |
+| `expected_actual_version` | **期望实绩版本**（正整数）；与当前实绩版本不一致返回 `409` |
+| `valid_seqs[]` | **有效流水号集合**（正整数、不得重复）；须与当前已登记有效事件的流水号集合**完全一致**（多交/少交均 `409`） |
+| `max_finish_delay_minutes` | **允许的最大完工延误分钟**（非负整数）；逐箱按冻结排程基线核算 |
+
+### 接受条件（任一不满足均不生成凭证）
+
+1. 方案存在且状态仍为 **`confirmed`**（未知方案 `404`；`draft`/`superseded` → `409`），且**已有登记实绩**（无实绩 → `409`）；
+2. **只接受已登记实绩**：提交的有效流水号集合与当前登记**完全一致**，且期望实绩版本与当前版本一致；
+3. **每箱均在截止前完工**（允许恰在 `cutoff_minute` 时刻完工）且**截止后无任何有效事件**（开工或完工均不可）；未完箱、截止后完工、截止后事件 → `422`，响应体分别给出 `unfinished_containers`、`finished_after_cutoff`、`events_after_cutoff`；
+4. **逐箱以冻结排程基线计算完工延误**：`完工延误 = max(0, 实际完工分钟 − 基线完工分钟)`（提前完工不计延误）。任一箱延误超过阈值 → **`422`，返回超限箱与偏差且不生成凭证**：
+
+```json
+{
+  "detail": "存在 1 箱完工延误超过允许阈值 5 分钟，本次交接被拒绝且不生成凭证",
+  "cutoff_minute": 30,
+  "allowed_max_delay_minutes": 5,
+  "exceeded_containers": [
+    {"container_no": "C002", "baseline_finish_minute": 18,
+     "actual_finish_minute": 20, "finish_delta_minutes": 2,
+     "delay_minutes": 2, "allowed_max_delay_minutes": 1}
+  ]
+}
+```
+
+### 成功时固化内容
+
+签发成功（`201`）一次性固化：**方案修订号、各箱实际开工/完工分钟与实际岸桥、冻结排程基线（基线起止与岸桥）、逐箱偏差（开工/完工偏差、是否换桥）、截止分钟、有效流水号集合、实绩版本与实绩指纹**（规范 SHA-256：版本 + 各事件现行流水号/类型/箱号/岸桥/分钟），返回服务端生成的**凭证号** `handover_id` 与摘要 `summary`（箱数、截止分钟、实绩版本、允许/观测最大延误、指纹算法）。
+
+### 生成前写事务复核（不留旧快照）
+
+- 生成在 SQLite `BEGIN IMMEDIATE` **写事务内**再次复核：**方案仍已确认**、**实绩版本未变**、**有效事件未变（指纹一致）与流水号集合未变**；并发的实绩更正或补登若在提交前生效，本次申请返回 `409` 且不生成凭证，**绝不固化更正/补登前的旧快照**；
+- 同交接号同内容的**重试优先返回原凭证**（即使其后实绩版本已被更正推进，也不重新评估、不重复生效，返回 `200`）；同交接号**异内容冲突**（含把交接号复用于另一方案）→ `409`，不生成新凭证；
+- 被拒绝的申请（422/409）**不占用交接号**：修正内容后可原号重试。
+
+### 凭证不可变与后续查询
+
+- **后续实绩变化不改凭证**：凭证签发后的实绩更正/补登照常走原登记/更正接口，凭证内容保持签发时快照；查询时以 `matches_current_actuals`（当前实绩指纹是否与凭证指纹一致）、`current_actual_version`、`current_fingerprint` **标示凭证是否仍对应当前实绩**；
+- **历史凭证仍可读**：方案被新修订取代（`superseded`）后拒绝新交接（`409`），但其历史凭证仍可查询；
+- 查询：`GET /api/plans/{plan_id}/handovers`（列该方案全部凭证）、`GET /api/plans/{plan_id}/handovers/{handover_id}`（方案内查询，不属于该方案 → `404`）、`GET /api/handovers/{handover_id}`（按凭证号全局查询，未知凭证 → `404`）。
+
+### 入参校验
+
+输入缺项、交接号空白、`valid_seqs` 为空/含非正整数/批内重复、截止分钟或阈值为负等 → `422`，**拒绝且不写入**。
+
+### curl 示例
+
+```bash
+# 签发（201）；请求体亦见 examples/handover.json
+curl -s -X POST $BASE/plans/<plan_id>/handovers \
+  -H 'Content-Type: application/json' -d @examples/handover.json
+
+# 同交接号同内容重试 -> 200 返回原凭证；异内容（含跨方案复用）-> 409
+# 期望版本过期 / 流水号集合不一致 / 方案未确认或已取代 / 无实绩 -> 409
+# 未完箱 / 截止后完工或事件 / 完工延误超阈值（附超限箱与偏差）-> 422，不生成凭证
+
+curl -s $BASE/plans/<plan_id>/handovers          # 该方案凭证列表
+curl -s $BASE/plans/<plan_id>/handovers/<hid>    # 方案内查询（404=不属于该方案）
+curl -s $BASE/handovers/<hid>                    # 按凭证号查询（含匹配标示）
+```
+
+## 六、逐港卸箱顺序
+
+方案**确认后**，按方案 ID 提交**每个卸港序号**的允许剩余总力矩闭区间，服务按该方案所用**箱重与槽位力臂**逐箱重算剩余总力矩，输出绑定该**方案修订**的逐港卸箱顺序。
+
+### 提交字段（`POST /api/plans/{plan_id}/unloading`）
+
+| 字段 | 含义 |
+| --- | --- |
+| `ports[]` | 每个卸港一条；`discharge_order` 必须与该方案箱清单中的卸港序号**完全一致**（不得缺失、多余或重复），顺序可任意提交（服务内部按港序号升序处理） |
+| `ports[].discharge_order` | 卸港序号（正整数，小者先卸） |
+| `ports[].min_remaining_moment` | 该港允许剩余总力矩闭区间下限 |
+| `ports[].max_remaining_moment` | 该港允许剩余总力矩闭区间上限；下限不得高于上限 |
+
+### 卸箱硬约束
+
+1. **逐港**：按卸港序号从小到大，每个卸箱位置只允许卸下属于该港的箱（每港只卸该港箱）；
+2. **堆栈先后**：同堆栈上层箱未卸时不得取下下层箱（按配载方案已占用层自底向上的连续链）；
+3. **逐步剩余总力矩**：每卸一箱后，以该方案箱重与槽位力臂重算
+   `剩余总力矩 = 初始总力矩 − Σ已卸(箱重 × 纵向力臂)`，结果必须落入**该箱所属卸港**的允许闭区间；全部卸完后剩余力矩恒为 0（故末港区间必须包含 0）。
+
+### 优选规则
+
+在所有港口均可完成的卸箱顺序中，取**全程箱号序列字典序最小**者（港口顺序固定，仅在港内/各可行先后间择优）。求解采用整数规划（PuLP/CBC），分块基数编码与完整字典序最小严格等价；求解结果在服务内再以 Python 对全部硬约束逐步复核，不盲信求解器数值容差。
+
+### 保存与生命周期
+
+- 仅 `confirmed` 方案可规划卸箱顺序；`draft`/`superseded` 返回 `409`；
+- 卸港序号不一致、区间倒置、重复港序等入参问题返回 `422`；**无可行顺序或求解无法确定同样返回 `422` 且不保存**（中文说明原因，如末港区间不含 0、堆栈先后与某港区间不相交）；
+- **保存前在写锁内再次核对方案仍为已确认**：若求解期间方案被新修订确认取代，返回 `409` 且不保存；
+- 同一方案修订重复提交以新顺序**原子替换**旧顺序；
+- 方案修订被新修订确认取代（`superseded`）后，其卸箱顺序转为 **`historical`**：
+  仍可通过 `GET /api/plans/{plan_id}/unloading` 或 `GET /api/unloading?historical=true` 查询，
+  但不再列入默认的当前顺序；
+- 卸箱顺序与装船排程相互独立：历史顺序/排程仍可查询，**不影响已有配载与装船排程**；
+- **空箱方案**：提交 `ports: []`，返回空顺序、初始/最终力矩均为 0。
+
+### 响应示例
+
+```json
+{
+  "plan_id": "5c643ef7...",
+  "revision_no": 1,
+  "status": "current",
+  "initial_moment": -30.0,
+  "final_moment": 0.0,
+  "ports": [
+    {"discharge_order": 1, "min_remaining_moment": -100.0, "max_remaining_moment": -30.0},
+    {"discharge_order": 2, "min_remaining_moment": -100.0, "max_remaining_moment": 100.0}
+  ],
+  "steps": [
+    {"step_no": 1, "discharge_order": 1, "container_no": "C003",
+     "slot_code": "B01", "stack": "B", "tier": 1, "weight": 10.0, "arm": 5.0,
+     "remaining_moment": -80.0},
+    {"step_no": 2, "discharge_order": 1, "container_no": "C001",
+     "slot_code": "A02", "stack": "A", "tier": 2, "weight": 10.0, "arm": -2.0,
+     "remaining_moment": -60.0},
+    {"step_no": 3, "discharge_order": 2, "container_no": "C002",
+     "slot_code": "A01", "stack": "A", "tier": 1, "weight": 30.0, "arm": -2.0,
+     "remaining_moment": 0.0}
+  ],
+  "created_at": "..."
+}
+```
+
+curl 示例（请求体亦见 `examples/unloading.json`）：
+
+```bash
+# 方案确认后提交（422=序号不一致/区间倒置/无可行顺序且不保存；409=未确认或保存前已被取代）
+curl -s -X POST $BASE/plans/<plan_id>/unloading \
+  -H 'Content-Type: application/json' -d @examples/unloading.json
+
+# 查询当前卸箱顺序；加 ?historical=true 可同时查历史顺序
+curl -s "$BASE/unloading"
+curl -s "$BASE/unloading?historical=true"
+
+# 按方案修订查询其绑定卸箱顺序（历史顺序同样可查，status=historical）
+curl -s $BASE/plans/<plan_id>/unloading
+```
+
+## 六之一、逐港卸箱执行（现场逐步登记，可偏离预案）
+
+逐港卸箱顺序确认后，码头现场执行时**允许选择不同于预案下一步的箱**逐箱登记：
+`POST /api/plans/{plan_id}/unloading/execute`（请求体亦见 `examples/unloading_execute.json`）。
+每次提交**方案号**（路径参数）、**箱号**、**全局唯一操作号**与**期望进度版本**。
+
+### 提交字段
+
+| 字段 | 含义 |
+| --- | --- |
+| `container_no` | 本次实际卸下的箱号；须属当前港且位于同堆栈最上层（箱号空白/不存在 422） |
+| `operation_no` | **全局唯一操作号**（非空字符串）：同号同内容重试返回首次结果，同号异内容（含跨方案复用）冲突 |
+| `expected_version` | **期望进度版本**（非负整数）；首次为 0，每次成功登记后 +1；与当前不一致返回 `409` |
+
+### 登记规则（任一不满足均不登记、进度不变）
+
+1. **无当前卸箱计划则拒绝**（`409`）：须先生成第六章的逐港卸箱顺序；方案 `draft`/`superseded` 同样 `409`；
+2. **当前港**取剩余箱中最小卸港序号；所选箱须**属于当前港**（否则 `422`）；
+3. 所选箱须位于其堆栈**剩余箱的最上层**（同堆栈上层未卸不得取下下层，否则 `422`）；
+4. 卸后**剩余总力矩须落入该港原定闭区间**（`剩余总力矩 = 上次剩余 − 箱重 × 力臂`，否则 `422`）；
+5. **前瞻可行性**：只有从新状态仍能按**港序、堆栈先后与各港力矩区间**卸完全部剩余箱时才登记；
+   所选箱即时合法但走入死局时返回 `422`，响应体随附 `blocked_reason`（求解器给出的中文阻碍原因）、
+   `current_port`、`remaining_moment_after`，**说明阻碍且进度不变**。
+
+### 冻结与生命周期
+
+- **首次登记在 `BEGIN IMMEDIATE` 写锁内冻结**当时的当前卸箱计划（全程箱号顺序）及该计划所用
+  **箱重、槽位力臂与各港力矩区间**（逐行快照）；此后对同一方案修订**重排原计划不改已卸记录，
+  也不改后续核算所用的箱重/力臂/港区间**；
+- 方案修订被新修订确认取代（`superseded`）后，执行进度**只读**：再登记返回 `409`，
+  但**历史进度仍可查询**（`status=historical`、`read_only=true`）；
+- 全部箱卸完后进度完结（`completed=true`、`read_only=true`），不再接受登记；
+- 并发现场登记通过写锁 + 期望进度版本**原子核对**串行化：版本过期（已被并发登记推进）返回 `409`，
+  过期版本或非法箱项都**不会留下部分进度**（步骤、版本、冻结快照、操作台账在同一事务内提交/回滚）。
+
+### 重试与冲突
+
+- **同操作号同内容**（箱号与期望版本均一致）的重复提交视为重试：不重复生效，返回 `200` 与
+  **首次登记的结果快照**（即使其后进度版本已被其他操作推进，或方案已被新修订取代）；
+- **同操作号异内容**（换箱号/换期望版本，或把操作号复用于另一方案）→ **冲突 `409`，进度不变**。
+
+### 查询（`GET /api/plans/{plan_id}/unloading/execution`）
+
+返回**已卸步骤**（逐步港序、箱号、箱重/力臂与卸后剩余力矩）、**当前港**、**剩余力矩**、
+**进度版本**与按现有**全程箱号字典序规则**求得的**可行剩余推荐顺序 `recommendation`**
+（每步含港序、箱号、槽位/堆栈/层、箱重、力臂与卸后剩余力矩；全部卸完为空），另含：
+
+- `planned_next_container`：冻结的**原计划**下一步箱号（现场可改选其他合法箱，两者形成对照）；
+- `frozen`/`frozen_at`：计划是否已被首次登记冻结及冻结时刻；
+- `status`（`current`/`historical`）、`read_only`、`completed`、`initial_moment`。
+
+首次登记**前**查询（已有卸箱计划）返回 `progress_version=0`、`frozen=false` 的预览，
+推荐顺序即原计划；无卸箱顺序或方案不存在返回 `404`。
+
+### curl 示例
+
+```bash
+# 首次登记（期望版本 0）；201=登记成功；响应给出从新状态出发的可行剩余推荐顺序
+curl -s -X POST $BASE/plans/<plan_id>/unloading/execute \
+  -H 'Content-Type: application/json' -d @examples/unloading_execute.json
+
+# 同操作号同内容重试 -> 200 返回首次结果快照；同号异内容（含跨方案）-> 409
+# 期望版本过期/并发已推进、方案未确认或已取代只读、卸箱计划缺失、已完结 -> 409
+# 箱不属当前港/不在栈顶/已卸过/箱号未知、卸后力矩出区间、新状态无可行后续（附阻碍原因）-> 422
+curl -s -X POST $BASE/plans/<plan_id>/unloading/execute \
+  -H 'Content-Type: application/json' \
+  -d '{"container_no":"C003","operation_no":"UNLOAD-0002","expected_version":1}'
+
+# 查询：已卸步骤、当前港、剩余力矩、进度版本与字典序最小的可行剩余推荐顺序
+curl -s $BASE/plans/<plan_id>/unloading/execution
+```
+
+## 七、应急改配（码头临时封锁槽位）
+
+码头临时封锁槽位时，按**当前已确认方案 ID** 与**不可用槽位编号列表**计算应急改配草稿。
+
+### 前置条件（不满足返回 `409`，不保存）
+
+1. 基础方案必须为当前 **`confirmed`** 方案（`draft`/`superseded` 拒绝）；
+2. 该方案所用**槽位资料修订**与**箱清单修订**均须为各自的**当前最新修订**
+   （资料已更新时，请先按最新资料走 `amend` → `confirm` 再申请应急改配）。
+
+### 提交字段（`POST /api/plans/{plan_id}/restow`，请求体亦见 `examples/restow.json`）
+
+| 字段 | 含义 |
+| --- | --- |
+| `blocked_slots` | 临时封锁、不可占用的槽位编号列表；**不得为空、不得含重复编号、不得含空白编号**（入参校验失败返回 `422`） |
+
+- 编号须**属于该方案所用槽位资料修订**，未知编号返回 `422`（中文说明，不保存）；
+- 封锁列表可包含原本就空着的槽位（此时若无需调整，换槽箱数为 0）。
+
+### 硬性约束（与第一章完全一致，另加封锁约束）
+
+1. **保持原方案全部箱及资料**：以当前最新槽位资料修订与箱清单修订参与计算，箱一个不增不减；
+2. **不可用槽位不得占用**（原槽被封的箱必然换槽；其余箱在可行时原位保留）；
+3. 继续满足**承重、堆叠支撑、重量次序、卸港先后、危险类别相邻、总力矩**全部既有约束。
+
+### 优选规则（三阶段，整数规划 PuLP/CBC）
+
+1. **最小化相对原方案换槽的箱数**（箱槽与原方案不同即记一次换槽）；
+2. 换槽箱数相同时，**最小化最高占用层**；
+3. 再相同时，**按箱号升序取槽位编号序列字典序最小**。
+
+求解结果在服务内再以 Python 对全部硬约束逐步复核（含封锁槽占用、原槽被封箱必换），不盲信求解器容差。
+
+### 响应示例
+
+```json
+{
+  "plan_id": "9c77...",
+  "revision_no": 2,
+  "status": "draft",
+  "root_id": "2f1e529a...",
+  "parent_id": "2f1e529a...",
+  "slots_revision": 1,
+  "manifest_revision": 1,
+  "blocked_slots": ["B01"],
+  "moved_boxes": 1,
+  "max_occupied_tier": 1,
+  "total_moment": 60.0,
+  "assignments": [
+    {"container_no": "C001", "slot_code": "A01", "stack": "A", "tier": 1},
+    {"container_no": "C002", "slot_code": "C01", "stack": "C", "tier": 1}
+  ],
+  "moves": [
+    {"container_no": "C002", "from_slot_code": "B01", "to_slot_code": "C01",
+     "from_stack": "B", "to_stack": "C", "from_tier": 1, "to_tier": 1}
+  ],
+  "created_at": "..."
+}
+```
+
+### 保存与生命周期
+
+- 草稿为方案链上的**新方案修订**（`revision_no = 基础方案修订号 + 1`，同 `root_id`、`parent_id` 指向基础方案），状态 `draft`；
+- **草稿不占用任何槽位、不改变原确认方案**：`confirmed_slots` 不动，原确认方案在新草稿确认前**持续有效**；
+- **无完整可行改配返回 `422` 且不保存**（中文说明原因，如可用槽不足、承重/堆叠/力矩等约束无法同时满足）；
+- **求解后保存前在 `BEGIN IMMEDIATE` 写锁内再次复核**，任一成立即返回 `409` 且不保存：
+  - 基础方案已被取代（状态不再是 `confirmed`）；
+  - 同方案链（同 `root_id`）出现了更新的方案修订；
+  - 基础方案所用槽位资料/箱清单发生变化（出现更新修订）；
+- 新草稿确认沿用**现有确认规则**：`POST /api/plans/{draft_id}/confirm` 仍须提交其
+  `slots_revision`/`manifest_revision` 并与最新修订核对，仍受槽位唯一占用约束串行化；
+  草稿确认后旧确认修订变为 `superseded` 并转移槽位占用，封锁槽位自然不再被占用；
+- **空箱方案**：封锁任意槽位均返回空草稿，`moved_boxes = 0`。
+
+curl 示例：
+
+```bash
+# 基于当前已确认方案计算应急改配草稿（422=编号非法/无可行改配且不保存；409=未确认/资料过期/保存前已变化）
+curl -s -X POST $BASE/plans/<plan_id>/restow \
+  -H 'Content-Type: application/json' -d @examples/restow.json
+
+# 草稿确认（沿用现有确认与槽位冲突规则；封锁槽不会被新确认占用）
+curl -s -X POST $BASE/plans/<draft_id>/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{"slots_revision":1,"manifest_revision":1}'
+```
+
+## 八、启动
+
+### 方式 A：Docker Compose（推荐，一键启动）
+
+```bash
+docker compose up --build -d
+docker compose logs -f stowage     # 查看日志
+docker compose down                # 停止（数据保留在卷 stowage-data 中）
+```
+
+镜像构建时完成依赖安装；容器入口 `scripts/entrypoint.sh` 会先幂等初始化数据库表结构，再启动 API。
+
+### 方式 B：本地直接运行
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+# 初始化（幂等）
+python -c "from app.database import init_db; init_db()"
+
+# 启动
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+### 方式 C：Docker
+
+```bash
+docker build -t stowage-service .
+docker run -d -p 8000:8000 -v stowage-data:/app/data stowage-service
+```
+
+## 九、配置
+
+全部配置通过环境变量覆盖（前缀 `STOWAGE_`，也可用 `.env`）：
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `STOWAGE_PORT` | `8000` | Compose 映射到宿主机的端口（仅 compose 用） |
+| `STOWAGE_DATABASE_URL` | `sqlite:///./data/stowage.db` | SQLAlchemy 数据库地址；容器内固定 `sqlite:////app/data/stowage.db` |
+| `STOWAGE_API_PREFIX` | `/api` | API 路由前缀 |
+
+## 十、地址与端口
+
+- 服务地址（本地）：`http://127.0.0.1:8000`
+- 健康检查：`GET http://127.0.0.1:8000/health`
+- API 前缀：`http://127.0.0.1:8000/api`
+- 交互式文档（Swagger UI）：`http://127.0.0.1:8000/docs`
+- OpenAPI：`http://127.0.0.1:8000/openapi.json`
+
+## 十一、HTTP API
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/api/slot-revisions` | 录入槽位资料，生成新槽位资料修订号 |
+| POST | `/api/manifest-revisions` | 录入箱清单，生成新箱清单修订号 |
+| GET | `/api/slot-revisions/{rev}` | 查询槽位资料修订 |
+| GET | `/api/manifest-revisions/{rev}` | 查询箱清单修订 |
+| POST | `/api/plans/compute` | 核算新方案（无解返回 422，不保存） |
+| POST | `/api/plans/{plan_id}/amend` | 基于现有方案重新核算，生成方案修订号 |
+| POST | `/api/plans/{plan_id}/confirm` | 确认方案（核对资料修订，409=过期/冲突） |
+| POST | `/api/plans/{plan_id}/restow` | **应急改配**：基于当前已确认方案与封锁槽位列表生成改配草稿（422=编号非法/无可行改配；409=未确认/资料过期/保存前已变化） |
+| POST | `/api/plans/{plan_id}/schedules` | 为**已确认方案修订**生成装船时间表（无解返回 422，不保存） |
+| GET | `/api/plans/{plan_id}/schedules` | 查询该方案修订绑定的装船时间表（历史排程可查） |
+| GET | `/api/schedules` | 列出装船时间表（默认仅当前；`?historical=true` 含历史） |
+| POST | `/api/plans/{plan_id}/actual-events` | **装船实绩**：登记逐箱实际开工/完工事件（事件可晚到、按分钟重放；首次原子冻结排程基线；201=新登记，200=同流水号同内容重试；409=无排程/方案未确认或已取代只读/流水号异内容冲突；422=箱不在方案/重放非法） |
+| POST | `/api/plans/{plan_id}/actual-events/correction` | **实绩更正**：凭原事件流水号、期望版本、更正请求号与替代完整事件，只更正该事件的分钟或岸桥（沿用原流水号/类型/箱号）；更正后全量重放，非法整次拒绝；成功版本+1、留原值与更正历史；201=更正生效，200=同请求号同内容重试返回首次快照；404=原事件未找到；409=版本过期/同请求号异内容/方案已取代只读；422=改类型或箱号/空更正/重放非法 |
+| GET | `/api/plans/{plan_id}/actuals` | 查询装船实绩：版本、每箱状态、实际起止、相对冻结基线偏差、原值、更正历史与未完箱（方案取代后仍可查，`read_only=true`） |
+| POST | `/api/plans/{plan_id}/handovers` | **装船完结交接**：凭交接号、截止分钟、期望实绩版本、有效流水号集合与最大完工延误阈值申请不可变凭证（201=签发，200=同交接号同内容重试返回原凭证；409=方案未确认或已取代/无实绩/版本过期/流水号集合不一致/同交接号异内容；422=入参非法/未完箱/截止后事件/延误超阈值附超限箱与偏差，均不生成凭证） |
+| GET | `/api/plans/{plan_id}/handovers` | 列出该方案的交接凭证（历史凭证仍可读） |
+| GET | `/api/plans/{plan_id}/handovers/{handover_id}` | 查询单个交接凭证（方案内；不属于该方案 404） |
+| GET | `/api/handovers/{handover_id}` | 按凭证号查询交接凭证（含 `matches_current_actuals` 标示；未知凭证 404） |
+| POST | `/api/plans/{plan_id}/unloading` | 为**已确认方案修订**规划逐港卸箱顺序（无可行顺序/无法确定返回 422，不保存） |
+| GET | `/api/plans/{plan_id}/unloading` | 查询该方案修订绑定的逐港卸箱顺序（历史顺序可查） |
+| GET | `/api/unloading` | 列出逐港卸箱顺序（默认仅当前；`?historical=true` 含历史） |
+| POST | `/api/plans/{plan_id}/unloading/execute` | **逐港卸箱执行**：现场登记卸下一箱（可偏离预案；当前港+栈顶+港区间+前瞻可行性通过才登记；首次冻结计划/箱重/力臂/港区间；201=登记，200=同操作号同内容重试返回首次快照；409=无计划/未确认或已取代只读/版本过期/同号异内容；422=非法箱项/力矩出区间/新状态无可行后续附阻碍原因） |
+| GET | `/api/plans/{plan_id}/unloading/execution` | 查询卸箱执行进度：已卸步骤、当前港、剩余力矩、进度版本与可行剩余推荐顺序（取代后历史进度仍可查，`read_only=true`） |
+| GET | `/api/plans` | 列出全部方案 |
+| GET | `/api/plans/{plan_id}` | 查询单个方案 |
+
+### 录入字段说明
+
+槽位 `slots[]`：
+
+| 字段 | 含义 |
+| --- | --- |
+| `code` | 槽位编号（建议定长如 `A01`，字典序即层位次序） |
+| `stack` | 堆栈编号；同堆栈按 `tier` 自底向上构成堆叠关系 |
+| `tier` | 层编号，自底向上从 1 开始的正整数 |
+| `capacity` | 槽位承重，非负 |
+| `arm` | 纵向力臂 |
+
+`adjacency`：相邻槽位编号对（无向），如 `[["A01","B01"]]`。
+`incompatible_classes`：不相容危险类别对，如 `[["1","5"]]`。
+
+箱 `containers[]`：
+
+| 字段 | 含义 |
+| --- | --- |
+| `no` | 箱号（同一清单内唯一） |
+| `weight` | 重量，必须大于 0（否则“非法重量”报错） |
+| `hazmat` | 危险类别字符串；普通箱传 `null` |
+| `discharge_order` | 卸港先后正整数，小者先卸 |
+
+### 错误处理
+
+- `400/404`：业务错误（修订/方案/排程/卸箱顺序/**卸箱执行进度**/**装船实绩/交接凭证**不存在等），中文 `detail`；**卸箱执行在方案未知或方案无卸箱顺序（且无执行进度）时返回 404（未找到）**；**实绩更正还在方案不存在、无实绩登记头或原事件流水号未找到时返回 404（未找到）**；**装船完结交接还在方案未知、凭证号未知或凭证不属于路径所给方案时返回 404（未找到）**；
+- `409 Conflict`：资料修订过期/不一致、重复确认、并发槽位占用冲突、对未确认方案排程或规划卸箱顺序、排程/卸箱顺序保存前方案已被新修订取代，原数据不变；**应急改配还在基础方案非已确认、资料非最新、或保存前基础方案被取代/同根出现新修订/资料变化时返回 409，原确认方案仍有效**；**装船实绩还在方案未确认/无当前排程、方案已被新修订取代（实绩只读）、同方案流水号同号异内容时返回 409，记录不变**；**实绩更正还在方案已被取代（只读）、期望实绩版本过期、同更正请求号提交异内容时返回 409，实绩/版本/更正历史不变**；**装船完结交接还在方案未确认或已被取代、无已登记实绩、期望实绩版本过期、有效流水号集合与登记不一致、同交接号异内容（含跨方案复用同一交接号）、或写事务生成前复核发现方案状态/实绩版本/有效事件（指纹）已被并发更正或补登改变时返回 409，不生成凭证**；**逐港卸箱执行还在方案未确认（draft）、无当前卸箱计划、方案已被新修订取代（进度只读）、全部箱已卸完、期望进度版本与当前版本不一致（过期或并发登记已推进）、同操作号提交异内容（含把全局唯一操作号复用于另一方案）时返回 409，进度不变**；
+- `422`：① 录入校验失败（非法重量、重复箱号、无效槽位、重复槽位编号、力矩区间倒置、排程箱项缺失/多余、岸桥数/时长非正、时间窗倒置、卸港序号缺失/多余/重复、卸港区间倒置等，**含应急改配封锁列表为空/重复/空白/编号不属于该槽位修订、实绩事件流水号非正/分钟为负/岸桥编号非正/事件类型非法/批内流水号重复、更正替代事件流水号与外层不一致/分钟为负/岸桥编号非正/事件类型非法/箱号为空、交接申请字段缺项/交接号空白/有效流水号集合为空或含非正整数或重复/截止分钟或最大完工延误为负**）；② 无完整可行方案、装船时间窗无解或**无可行逐港卸箱顺序/求解无法确定**（均**不保存**）；**应急改配无完整可行改配同样返回 422 且不保存**；**装船实绩重放非法（重复开工/完工、开工撞桥、同堆栈下层未完工即开工上层、完工岸桥与开工不一致、完工不严格晚于开工、岸桥超出冻结排程数量、箱不在方案）同样整批返回 422，已登记事件保持不变**；**实绩更正试图改变事件类型或箱号、空更正（分钟与岸桥均未变）、或更正后全量重放链非法时整次返回 422，实绩、实绩版本与更正历史均不变**；**装船完结交接还在存在未完箱、某箱截止分钟之后完工、截止后仍有有效事件、或任一箱按冻结基线计算的完工延误超过允许阈值时返回 422 且不生成凭证（响应体随附未完箱/截止后箱与事件，或 `exceeded_containers` 超限箱及其基线/实际完工分钟、偏差与允许阈值）**；**逐港卸箱执行在入参非法（箱号/操作号空白、期望版本为负）、所选箱未知或已卸下、不属当前港、不在同堆栈最上层、卸后剩余总力矩不在该港原定闭区间、或所选箱即时合法但从新状态无法再按港序/堆栈先后/各港力矩区间卸完全部剩余箱时整次返回 422，步骤、进度版本、冻结快照与操作台账均不写入（响应体随附 `blocked_reason` 阻碍原因、`current_port` 与 `remaining_moment_after`）**。
+
+## 十二、请求示例（curl）
+
+```bash
+BASE=http://127.0.0.1:8000/api
+
+# 1) 录入槽位资料（得到 slots_revision）
+curl -s -X POST $BASE/slot-revisions -H 'Content-Type: application/json' -d '{
+  "slots": [
+    {"code":"A01","stack":"A","tier":1,"capacity":100,"arm":2.0},
+    {"code":"A02","stack":"A","tier":2,"capacity":100,"arm":3.0},
+    {"code":"B01","stack":"B","tier":1,"capacity":100,"arm":2.0},
+    {"code":"B02","stack":"B","tier":2,"capacity":100,"arm":3.0}
+  ],
+  "adjacency": [["A01","B01"],["A02","B02"]],
+  "incompatible_classes": [["1","5"]],
+  "min_moment": -100000,
+  "max_moment": 100000
+}'
+
+# 2) 录入箱清单（得到 manifest_revision）
+curl -s -X POST $BASE/manifest-revisions -H 'Content-Type: application/json' -d '{
+  "containers": [
+    {"no":"C002","weight":20,"hazmat":null,"discharge_order":1},
+    {"no":"C001","weight":10,"hazmat":null,"discharge_order":1}
+  ]
+}'
+
+# 3) 核算方案（可省略修订号，默认取双方最新修订；无解返回 422 且不保存）
+curl -s -X POST $BASE/plans/compute -H 'Content-Type: application/json' -d '{}'
+# -> assignments: C001->A01, C002->B01；total_moment=60；revision_no=1
+
+# 4) 确认方案（核对资料修订；过期/冲突返回 409，原方案不变）
+curl -s -X POST $BASE/plans/<plan_id>/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{"slots_revision":1,"manifest_revision":1}'
+
+# 5) 资料更新后修订并重新核算（生成 revision_no=2 的草稿，原确认方案暂保持）
+curl -s -X POST $BASE/plans/<plan_id>/amend \
+  -H 'Content-Type: application/json' -d '{}'
+
+# 6) 方案确认后生成装船时间表（详见第四章；422=箱项不一致/时间窗无解且不保存）
+curl -s -X POST $BASE/plans/<plan_id>/schedules \
+  -H 'Content-Type: application/json' -d @examples/schedule.json
+
+# 6.1) 码头逐箱登记实际开工/完工（详见第五章；首次登记原子冻结当时排程为偏差基线）
+#      201=新事件登记；200=同流水号同内容重试；409=无排程/方案已取代只读/同号异内容冲突；
+#      422=箱不在方案/按分钟重放非法（撞桥、下层未完工、完工桥不一致、完工不晚于开工）
+curl -s -X POST $BASE/plans/<plan_id>/actual-events \
+  -H 'Content-Type: application/json' -d @examples/actual_events.json
+curl -s $BASE/plans/<plan_id>/actuals     # 版本/每箱状态/实际起止/偏差/更正历史/未完箱/重放顺序
+
+# 6.2) 发现分钟或岸桥录错：凭原流水号+期望版本+更正请求号+替代完整事件更正
+#      只改 minute/crane_no，沿用原流水号/类型/箱号；成功版本+1（详见第五章）
+#      201=更正生效；200=同请求号同内容重试返回首次结果快照；
+#      404=原事件未找到；409=版本过期/同请求号异内容/方案已取代只读；
+#      422=改了类型或箱号/空更正/更正后重放链非法（实绩、版本、历史均不变）
+curl -s -X POST $BASE/plans/<plan_id>/actual-events/correction \
+  -H 'Content-Type: application/json' -d @examples/actual_event_correction.json
+
+# 6.3) 装船完结交接：申请不可变凭证（详见第五之一章；请求体亦见 examples/handover.json）
+#      201=凭证签发；200=同交接号同内容重试返回原凭证（不重新评估）；
+#      404=方案/凭证未找到；409=方案未确认或已取代/无实绩/版本过期/
+#          流水号集合不一致/同交接号异内容（含跨方案复用）/写事务内复核已变化；
+#      422=入参非法，或未完箱/截止后完工或事件/完工延误超阈值（附超限箱与偏差），不生成凭证
+curl -s -X POST $BASE/plans/<plan_id>/handovers \
+  -H 'Content-Type: application/json' -d @examples/handover.json
+
+# 7) 方案确认后规划逐港卸箱顺序（详见第六章；422=卸港序号不一致/区间倒置/无可行顺序且不保存）
+curl -s -X POST $BASE/plans/<plan_id>/unloading \
+  -H 'Content-Type: application/json' -d @examples/unloading.json
+
+# 7.0) 现场逐箱登记卸箱（可偏离预案，详见第六之一章；首次期望版本为 0）
+#      201=登记成功；200=同操作号同内容重试返回首次快照；
+#      409=无卸箱计划/方案未确认或已取代只读/期望版本过期/同号异内容冲突；
+#      422=箱不属当前港/不在栈顶/已卸过/未知箱、卸后力矩出港区间、新状态无可行后续（附阻碍原因）
+curl -s -X POST $BASE/plans/<plan_id>/unloading/execute \
+  -H 'Content-Type: application/json' -d @examples/unloading_execute.json
+# 查询执行进度：已卸步骤、当前港、剩余力矩、版本与字典序最小的可行剩余推荐顺序
+curl -s $BASE/plans/<plan_id>/unloading/execution
+
+# 7.1) 码头临时封锁 B01：基于当前已确认方案生成应急改配草稿（详见第七章）
+#      422=封锁编号非法/无完整可行改配且不保存；409=方案未确认/资料非最新/保存前已变化
+curl -s -X POST $BASE/plans/<plan_id>/restow \
+  -H 'Content-Type: application/json' -d @examples/restow.json
+# -> revision_no=2、status=draft；moved_boxes=1：C002 由 B01 改配到 C01；原确认方案仍 confirmed
+
+# 7.2) 确认应急改配草稿（沿用现有确认与槽位冲突规则；409=资料再变更过期）
+curl -s -X POST $BASE/plans/<draft_id>/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{"slots_revision":1,"manifest_revision":1}'
+
+# 8) 查询
+curl -s $BASE/plans
+curl -s $BASE/plans/<plan_id>
+curl -s "$BASE/schedules"                 # 当前排程
+curl -s "$BASE/schedules?historical=true" # 含历史排程
+curl -s $BASE/plans/<plan_id>/schedules   # 按方案修订查排程
+curl -s $BASE/plans/<plan_id>/actuals     # 装船实绩（版本/基线偏差/原值/更正历史/未完箱；取代后只读仍可查）
+curl -s $BASE/plans/<plan_id>/handovers   # 该方案交接凭证列表（历史凭证仍可读）
+curl -s $BASE/handovers/<handover_id>     # 按凭证号查；matches_current_actuals 标示是否仍对应当前实绩
+curl -s "$BASE/unloading"                 # 当前卸箱顺序
+curl -s "$BASE/unloading?historical=true" # 含历史卸箱顺序
+curl -s $BASE/plans/<plan_id>/unloading   # 按方案修订查卸箱顺序
+curl -s $BASE/plans/<plan_id>/unloading/execution  # 卸箱执行进度（已卸/当前港/剩余力矩/版本/推荐顺序）
+```
+
+方案响应示例：
+
+```json
+{
+  "plan_id": "2f1e529a...",
+  "revision_no": 1,
+  "status": "confirmed",
+  "slots_revision": 1,
+  "manifest_revision": 1,
+  "total_moment": 60.0,
+  "max_occupied_tier": 1,
+  "assignments": [
+    {"container_no": "C001", "slot_code": "A01", "stack": "A", "tier": 1},
+    {"container_no": "C002", "slot_code": "B01", "stack": "B", "tier": 1}
+  ],
+  "parent_id": null,
+  "root_id": "2f1e529a...",
+  "created_at": "...",
+  "confirmed_at": "..."
+}
+```
+
+更多现成请求体见 `examples/` 目录，可直接：
+
+```bash
+curl -s -X POST $BASE/slot-revisions    -H 'Content-Type: application/json' -d @examples/slots.json
+curl -s -X POST $BASE/manifest-revisions -H 'Content-Type: application/json' -d @examples/containers.json
+```
+
+## 十三、测试
+
+```bash
+pip install pytest httpx
+PYTHONPATH=. pytest -q
+```
+
+测试覆盖：配载求解器全部约束与两阶段优选、岸桥调度求解器全部约束与 makespan/字典序优选、逐港卸箱顺序求解器全部约束（逐港/堆栈先后/逐步力矩区间）与全程箱号字典序优选（含 200+ 随机案例穷举交叉验证）、**应急改配三阶段优选（最少换槽→最低层级→字典序）与封锁/承重/堆叠/重量次序/卸港/危邻/力矩全约束 Python 复核**、**装船实绩事件重放（同分钟完工先于开工、开工无重复/桥空闲/下层已完工、完工同桥且严格晚于开工、晚到事件使原链失效整批拒绝、同号幂等/异号冲突、基线冻结后重排与方案取代不改写、取代后只读、并发首次绑定串行化）**、**实绩更正（只改分钟/岸桥且沿用流水号/类型/箱号、更正后全量重放非法整次拒绝且版本/历史/实绩不变、成功版本+1并留原值与更正历史、同请求号同内容重试即使版本推进也返回首次快照不重复生效、同请求号异内容/版本过期 409、原事件未找到 404、方案取代只读、更正后原登记接口仍按首次登记内容识别重试与冲突、并发更正在写锁下串行）**、**装船完结交接不可变凭证（截止前全完工含恰好截止、截止后无有效事件、按冻结基线逐箱完工延误阈值判定并返回超限箱与偏差、提前不计负延误、入参缺项/流水号重复非正/负阈值 422、未知方案或凭证 404、方案未确认或已取代/无实绩/期望版本过期/流水号集合未知或遗漏 409、固化方案修订/各箱实际起止与岸桥/冻结基线/偏差/截止/流水号集合/实绩版本与指纹、写事务内复核方案状态/版本/指纹并发变化不留旧快照、同交接号同内容重试 200 返回原凭证且其后版本推进不重新评估、同交接号异内容及跨方案复用 409、失败不占用交接号、签发后更正不改凭证仅以 matches_current_actuals 标示、方案取代后历史凭证仍可读、同号并发请求串行化为 200/201）**、录入校验（非法重量/重复箱号/无效槽位/时间窗倒置/卸港序号不一致与区间倒置/封锁列表空或重复或编号越修订/实绩事件入参/更正入参/交接入参）、无解不落库、过期修订拒绝、方案修订链、并发确认互斥、装船排程与卸箱顺序的箱项一致性及历史标记、以及排程/卸箱顺序/**应急改配**保存前的方案状态/同根新修订/资料变化复核、以及**逐港卸箱现场执行（首次版本为 0 且无计划拒绝；当前港取剩余最小卸港序号、所选箱须属该港且为栈顶、卸后力矩入原定闭区间、新状态前瞻可行才登记；偏离预案选箱与字典序剩余推荐；非法箱项/力矩出界/死局附阻碍原因均 422 且不留部分进度；首次冻结计划与箱重/力臂/港区间后重排不改已卸记录；方案取代后只读且历史可查；同操作号同内容重试 200 返回首次快照、异内容及跨方案复用 409；期望版本原子核对、过期 409；并发登记串行化；完结后只读）**（共 198 个用例）。
+
+## 十四、目录结构
+
+```
+app/
+  config.py      # 环境变量配置
+  database.py    # 引擎/会话/建表，SQLite WAL、外键、busy_timeout
+  models.py      # ORM：资料修订、方案、方案项、已确认占用、装船排程、卸箱顺序、卸箱执行进度/冻结箱港/已卸步骤/操作台账、实绩事件/基线/更正、交接凭证/逐箱快照等
+  schemas.py     # Pydantic 模式与录入校验
+  solver.py      # 配载 MILP 与两阶段优选、应急改配三阶段优选（核心）
+  scheduler.py   # 装船时间表（岸桥调度）MILP 与两阶段优选（核心）
+  actuals.py     # 装船实绩事件重放引擎：晚到重排、同分钟完工先于开工、全约束校验（核心）
+  unloader.py    # 逐港卸箱顺序 MILP、字典序优选与全约束 Python 复核（核心）
+  services.py    # 业务逻辑、并发安全确认、排程/卸箱顺序/应急改配保存前复核、实绩基线冻结/登记与更正、交接凭证签发（写事务复核/指纹/幂等）与查询、逐港卸箱执行（首次冻结/版本原子核对/栈顶与港区间校验/前瞻可行/操作号幂等）（版本+留档+幂等快照）
+  routers.py     # HTTP 路由
+  main.py        # FastAPI 入口
+scripts/entrypoint.sh  # 容器初始化入口（create_all + 幂等补列迁移）
+tests/           # 单元/接口/并发测试（含调度器/卸箱顺序穷举交叉验证、应急改配、实绩重放与更正、交接凭证、卸箱执行进度）
+examples/        # 请求示例（含 schedule.json、actual_events.json、actual_event_late.json、actual_event_correction.json、handover.json、unloading.json、unloading_execute.json、restow.json）
+Dockerfile / docker-compose.yml / requirements.txt
+```
